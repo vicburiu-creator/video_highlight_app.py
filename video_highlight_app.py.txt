@@ -1,0 +1,94 @@
+import os
+import shutil
+import tempfile
+import whisper
+import streamlit as st
+from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip
+from scenedetect import VideoManager, SceneManager
+from scenedetect.detectors import ContentDetector
+from transformers import pipeline
+
+# Load models
+stt_model = whisper.load_model("base")
+summarizer = pipeline("summarization")
+
+# Ensure output folder
+OUTPUT_DIR = "output_clips"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Function to transcribe audio using Whisper
+def transcribe_audio(video_path):
+    result = stt_model.transcribe(video_path)
+    return result['text']
+
+# Function to detect scenes using PySceneDetect
+def detect_scenes(video_path):
+    video_manager = VideoManager([video_path])
+    scene_manager = SceneManager()
+    scene_manager.add_detector(ContentDetector(threshold=30.0))
+    video_manager.set_downscale_factor()
+    video_manager.start()
+    scene_manager.detect_scenes(frame_source=video_manager)
+    scenes = scene_manager.get_scene_list()
+    video_manager.release()
+    return [(start.get_seconds(), end.get_seconds()) for start, end in scenes]
+
+# Function to summarize text using HuggingFace
+def summarize_text(text):
+    chunks = [text[i:i+1000] for i in range(0, len(text), 1000)]
+    summaries = summarizer(chunks, max_length=120, min_length=40, do_sample=False)
+    return " ".join([s['summary_text'] for s in summaries])
+
+# Extract video segment and add burned captions
+def export_clip_with_caption(video_path, start, end, caption, idx):
+    clip = VideoFileClip(video_path).subclip(start, end)
+    txt_clip = TextClip(caption, fontsize=24, color='white', bg_color='black', method='caption', size=clip.size)
+    txt_clip = txt_clip.set_duration(clip.duration).set_position(("center", "bottom"))
+    final = CompositeVideoClip([clip, txt_clip])
+    output_path = os.path.join(OUTPUT_DIR, f"highlight_{idx+1}.mp4")
+    final.write_videofile(output_path, codec="libx264", audio_codec="aac")
+    return output_path
+
+# Main Streamlit app
+def main():
+    st.title("🎬 AI Video Highlight Generator")
+    st.write("Upload a long video. The AI will extract 60–120s highlights and add captions.")
+
+    uploaded_file = st.file_uploader("Upload Video", type=["mp4", "mov", "mkv"])
+
+    if uploaded_file is not None:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp.write(uploaded_file.read())
+            tmp_path = tmp.name
+
+        st.video(tmp_path)
+        st.info("🔁 Transcribing video...")
+        full_transcript = transcribe_audio(tmp_path)
+
+        st.success("✅ Transcription complete.")
+        st.download_button("Download Transcript", full_transcript, file_name="transcript.txt")
+
+        st.info("🔍 Detecting scenes...")
+        scenes = detect_scenes(tmp_path)
+
+        st.info("🧠 Summarizing transcript to identify highlight-worthy content...")
+        summary = summarize_text(full_transcript)
+
+        st.success("🧩 Generating highlight clips...")
+
+        clip_count = 0
+        for i, (start, end) in enumerate(scenes):
+            duration = end - start
+            if 60 <= duration <= 120:
+                clip_caption = summarize_text(full_transcript[int(start)*10:int(end)*10])[:100] + "..."
+                output_path = export_clip_with_caption(tmp_path, start, end, clip_caption, clip_count)
+                clip_count += 1
+                st.video(output_path)
+                with open(output_path, 'rb') as f:
+                    st.download_button(f"⬇️ Download Clip {clip_count}", f, file_name=os.path.basename(output_path))
+
+        if clip_count == 0:
+            st.warning("❌ No scenes between 60 and 120 seconds were found.")
+
+if __name__ == "__main__":
+    main()
